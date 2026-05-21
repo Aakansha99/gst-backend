@@ -13,6 +13,7 @@ Runtime constraints:
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from pathlib import Path
 
@@ -41,16 +42,17 @@ app = FastAPI(
 async def _log_startup() -> None:
     logger.info("gst-statement-api startup — exception handler active")
 
-# Allow the Vite dev server (default 5173) to call the API directly during
-# development. In production you'd typically front the API and the static
-# site behind the same origin, in which case CORS becomes irrelevant.
+# CORS: allow the frontend origin. In production, set the ALLOWED_ORIGINS
+# env var to the deployed frontend URL (comma-separated if multiple).
+# Defaults to localhost dev servers.
+_allowed_origins = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173",
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:4173",  # vite preview
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=[o.strip() for o in _allowed_origins],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     allow_credentials=False,
