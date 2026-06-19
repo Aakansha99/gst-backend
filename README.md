@@ -166,7 +166,7 @@ gst-backend/
 
 The parser pipeline:
 
-1. **Table extraction** — tries multiple pdfplumber strategies (auto, lines, text, hybrid) per page and picks the one that returns the most date-bearing rows
+1. **Table extraction** — tries multiple pdfplumber strategies (auto, lines, text, hybrid) per page and picks the one with the best density-weighted score (favoring strategies where date-bearing rows make up a high proportion of total rows, not just the raw count)
 2. **Column profiling** — counts what fraction of each column's cells look like dates, decimals, or text
 3. **Column identification** — date column = highest date ratio; money columns = decimal-bearing; description = longest text; balance = the money column with incremental continuity
 4. **Debit/credit classification** — correlates each money column's values with balance deltas to determine which is debit and which is credit
