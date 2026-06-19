@@ -60,8 +60,7 @@ DATE_PATTERNS = [
     re.compile(r"^\d{2}-[A-Za-z]{3}-\d{2}$"),                  # 07-May-25
 ]
 
-# Indian-formatted (1,82,196.96) or plain (123.45) decimals.
-AMOUNT_PATTERN = re.compile(r"^-?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?$")
+AMOUNT_PATTERN = re.compile(r"^-?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{0,2})?$")
 
 # Trailing Cr / Dr suffix used by some banks (Allahabad uses "1000.00 CR").
 AMOUNT_SUFFIX_PATTERN = re.compile(r"\s*(CR|DR|Cr|Dr|cr|dr)\s*$")
@@ -207,10 +206,14 @@ def _parse_amount(cell: str) -> float | None:
     Handles Indian/US comma grouping, optional sign, and trailing CR/DR
     indicators. The CR/DR suffix is *not* applied to the sign here — the
     caller decides that, since some banks report balance with CR/DR but
-    transaction amounts without."""
+    transaction amounts without.
+
+    Also handles trailing-dot amounts (e.g. '1,40,717.') by normalizing them
+    to two decimal places before parsing."""
     if not cell:
         return None
     body, _ = _strip_amount_suffix(cell)
+    body = _normalize_trailing_dot(body)
     cleaned = body.replace(",", "").replace(" ", "")
     try:
         return float(cleaned)
@@ -218,11 +221,25 @@ def _parse_amount(cell: str) -> float | None:
         return None
 
 
+def _normalize_trailing_dot(cell: str) -> str:
+    """If a cell ends with a decimal point and no following digits (e.g.
+    '1,40,717.'), append '00' so downstream parsing treats it as a valid
+    two-decimal-place amount. This happens in ICICI detailed statements where
+    pdfplumber splits the decimal portion onto a continuation row."""
+    stripped = cell.strip()
+    if stripped.endswith("."):
+        return stripped + "00"
+    return cell
+
+
 def _is_decimal_amount(cell: str) -> bool:
-    """Strict: must contain a decimal point (e.g. money amounts like 1,234.56)."""
+    """Strict: must contain a decimal point (e.g. money amounts like 1,234.56).
+    Also accepts trailing-dot amounts (e.g. '1,40,717.') which occur in ICICI
+    statements where the fractional part is on a continuation row."""
     if not cell:
         return False
     body, _ = _strip_amount_suffix(cell)
+    body = _normalize_trailing_dot(body)
     return _is_amount(body) and "." in body
 
 
@@ -414,23 +431,66 @@ def _merge_continuation_rows(
     if date_col is None:
         return rows
 
+    def _looks_like_date_fragment(current_date: str, next_row: list[str]) -> bool:
+        """Check if current_date is likely a fragment of a longer date split
+        across rows. E.g. '01/Jan/20' followed by a row starting with '26'."""
+        if not current_date:
+            return False
+        # If the cell matches a 2-digit year date pattern (DD/Mon/YY) but the
+        # "year" part is actually the first 2 digits of a 4-digit year, the
+        # next row will have the remaining 2 digits in the same column.
+        if date_col < len(next_row):
+            next_cell = _clean_cell(next_row[date_col])
+            # The next cell is just 2 digits — likely the continuation of a
+            # 4-digit year that got split.
+            if re.match(r"^\d{2}$", next_cell):
+                # Check the current ends with a 2-digit number that could be
+                # the first half of a year (19, 20, 21, etc.)
+                if re.search(r"[/\-](19|20|21)\s*$", current_date):
+                    return True
+        return False
+
     merged: list[list[str]] = []
-    for r in rows:
+    i = 0
+    while i < len(rows):
+        r = rows[i]
         normalised = [_clean_cell(c) for c in r]
-        if not _is_date(normalised[date_col] if date_col < len(normalised) else ""):
+        date_cell = normalised[date_col] if date_col < len(normalised) else ""
+
+        if not _is_date(date_cell):
+            # No date — continuation row.
             if not merged:
-                # Continuation before any anchor row — drop it.
+                i += 1
                 continue
-            for i, cell in enumerate(normalised):
+            for j, cell in enumerate(normalised):
                 if not cell:
                     continue
-                if i >= len(merged[-1]):
-                    merged[-1].extend([""] * (i - len(merged[-1]) + 1))
-                merged[-1][i] = (
-                    f"{merged[-1][i]} {cell}".strip() if merged[-1][i] else cell
+                if j >= len(merged[-1]):
+                    merged[-1].extend([""] * (j - len(merged[-1]) + 1))
+                merged[-1][j] = (
+                    f"{merged[-1][j]} {cell}".strip() if merged[-1][j] else cell
                 )
         else:
+            # Has a date — but check if it's a fragment that should be merged
+            # with the next row (or if the next row is a continuation of this one).
+            # First, check if the NEXT row looks like it completes this row's date.
+            if i + 1 < len(rows) and _looks_like_date_fragment(date_cell, rows[i + 1]):
+                # This row's date is something like "01/Jan/20" and next row has "26".
+                # Merge the next row into this one first, then add as new transaction.
+                next_normalised = [_clean_cell(c) for c in rows[i + 1]]
+                for j, cell in enumerate(next_normalised):
+                    if not cell:
+                        continue
+                    if j >= len(normalised):
+                        normalised.extend([""] * (j - len(normalised) + 1))
+                    normalised[j] = (
+                        f"{normalised[j]}{cell}".strip() if normalised[j] else cell
+                    )
+                merged.append(normalised)
+                i += 2  # skip the next row since we consumed it
+                continue
             merged.append(normalised)
+        i += 1
     return merged
 
 
@@ -532,16 +592,31 @@ def _extract_period(
 
 # ---------- Core pipeline ----------
 
-def _score_table_set(tables: list[list[list[str]]]) -> int:
-    """Score a list of tables by how many rows contain a date cell anywhere.
-    Higher is better — used to pick the best extraction strategy per page."""
-    score = 0
+def _score_table_set(tables: list[list[list[str]]]) -> float:
+    """Score a list of tables by how many rows contain a date cell anywhere,
+    weighted by the density of date-bearing rows relative to total rows.
+
+    A strategy that produces 14 date-rows out of 15 total rows (93% density)
+    is better than one that produces 15 date-rows out of 109 total rows (14%
+    density). The latter typically indicates that the extraction strategy
+    included metadata/header content in the table body, producing garbled
+    column alignment.
+
+    Score = date_row_count * (date_row_count / total_rows)
+    This rewards both quantity AND density of date-bearing rows.
+    """
+    date_row_count = 0
+    total_rows = 0
     for t in tables:
         for row in t:
+            total_rows += 1
             cells = [_clean_cell(c) for c in row]
             if any(_is_date(c) for c in cells):
-                score += 1
-    return score
+                date_row_count += 1
+    if total_rows == 0:
+        return 0.0
+    density = date_row_count / total_rows
+    return date_row_count * density
 
 
 def _extract_tables_per_page(pdf: pdfplumber.PDF) -> list[list[list[list[str]]]]:
@@ -565,7 +640,7 @@ def _extract_tables_per_page(pdf: pdfplumber.PDF) -> list[list[list[list[str]]]]
     per_page: list[list[list[list[str]]]] = []
     for page in pdf.pages:
         best_tables: list[list[list[str]]] = []
-        best_score = -1
+        best_score = -1.0
         for settings in strategies:
             try:
                 tables = (
